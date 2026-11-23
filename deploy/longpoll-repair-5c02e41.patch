@@ -1,106 +1,3 @@
-diff --git a/deploy/ROLLOUT.md b/deploy/ROLLOUT.md
-new file mode 100644
-index 0000000..30fea45
---- /dev/null
-+++ b/deploy/ROLLOUT.md
-@@ -0,0 +1,97 @@
-+# Long-poll repair rollout
-+
-+This change is for the installed plugin on the coordinator computer. It does not touch WeChat credentials, the inbox, or the saved cursor by itself. Deploy it only after the files below are reviewed. A green test run does not mean production is fixed; watch a real quiet period of 30–60 minutes after restart.
-+
-+## What is safe to keep
-+
-+Leave these in place:
-+
-+- `~/.grok-wechat/account.json` (tokens, `getUpdatesBuf`, context tokens)
-+- `~/.grok-wechat/inbox.jsonl`
-+- `~/.grok-wechat/wake.json` and any per-account wake copied into `account.json`
-+- `~/.grok-wechat/media/`
-+- the webhook SSRF checks in `sendWake` (`lookupWakeAddress`, the public-address block list, `AbortSignal.timeout` on the webhook). Do not replace `server/ilink.js` with a copy that drops those functions.
-+
-+Do not set `GROK_WECHAT_POLL_BUDGET_MS`, `GROK_WECHAT_RETRY_MS`, `GROK_WECHAT_BACKOFF_MS`, `GROK_WECHAT_EXPIRED_MS`, `GROK_WECHAT_MEDIA_TIMEOUT_MS`, or `GROK_WECHAT_WATCHDOG_SLACK_MS` in production. Those exist so tests can shorten timers.
-+
-+Do not change proxy environment variables, `NODE_USE_ENV_PROXY`, or `NO_PROXY`. The long poll uses Node's global HTTP agent, which follows the same managed-egress flag as `fetch`.
-+
-+## Before editing
-+
-+On the coordinator, from the installed plugin directory:
-+
-+```sh
-+PLUGIN=/home/box/grok-wechat-plugin
-+STATE=${GROK_WECHAT_HOME:-$HOME/.grok-wechat}
-+mkdir -p /tmp/grok-wechat-pre-longpoll
-+cp -a "$PLUGIN/server/ilink.js" "$PLUGIN/server/index.js" "$PLUGIN/server/store.js" "$PLUGIN/server/uninstall.js" /tmp/grok-wechat-pre-longpoll/
-+cp -a "$STATE/account.json" "$STATE/inbox.jsonl" "$STATE/wake.json" /tmp/grok-wechat-pre-longpoll/ 2>/dev/null || true
-+shasum "$PLUGIN/server/ilink.js" "$PLUGIN/server/index.js"
-+```
-+
-+Record the running monitor pid from `$STATE/monitor.pid`. The new code does not load until that process exits.
-+
-+## Which tree you have
-+
-+- Fork parent `f1d893fd9bf5bd256f05fac0ef5228539acf4ede` already contains `lookupWakeAddress` and does not auto-uninstall when the connector disappears. Apply this branch's `server/` diff onto that tree.
-+- An install still based on `5c02e41` plus a local webhook SSRF edit will not take that diff cleanly. `getUpdates` in that base matches the pre-change function, but `runMonitor` and the wake call do not. Do not overwrite `ilink.js` or `index.js`. Copy in `server/bounded-request.js`, then move only the long-poll helpers, `getUpdates`, the monitor loop, health helpers, and the `monitor-health.json` uninstall entry across by hand. Leave the local `sendWake` implementation untouched.
-+
-+## Apply on the matching fork tree
-+
-+```sh
-+cd /home/box/grok-wechat-plugin
-+# review the diff first; do not apply if sendWake differs from the backup
-+git diff --check f1d893fd9bf5bd256f05fac0ef5228539acf4ede cursor/wechat-longpoll-repair-c88f -- server
-+git checkout cursor/wechat-longpoll-repair-c88f -- server/bounded-request.js server/ilink.js server/index.js server/store.js server/uninstall.js server/test/longpoll.test.js
-+node --test server/test/*.test.js
-+```
-+
-+Node on the box should be 22.23.4, the version these tests ran on.
-+
-+## Restart without dropping state
-+
-+Stop only the monitor process. Do not delete the state directory.
-+
-+```sh
-+PID=$(cat "$STATE/monitor.pid" 2>/dev/null || true)
-+if [ -n "$PID" ]; then kill -TERM "$PID"; fi
-+# wait until the pid is gone; SIGTERM runs notifyStop and clears the pid only if it still names that process
-+for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
-+cd "$PLUGIN"
-+node server/index.js --ensure-monitor
-+```
-+
-+`--ensure-monitor` starts one poller when the old pid is gone. It does not log in again and does not clear `getUpdatesBuf`.
-+
-+## What to look at after restart
-+
-+`wechat_status` now includes `monitor_health`. In the first minute `stale` should be false. `monitor.log` should show lines like:
-+
-+```text
-+poll outcome=empty bot=<id> duration_ms=<n> deadline_ms=<n> msgs=0 consecutive_timeouts=0
-+```
-+
-+or `outcome=messages` / `outcome=timeout`. It must not contain the bot token, webhook key, cursor, or message text. A timeout is an expected empty hold that ran past the deadline; it does not move the cursor. `outcome=error` is a real failure and backs off.
-+
-+`stale: true` with `stale_reason: poll-overdue` means a poll exceeded its deadline and the process was still alive. The next `wechat_start_monitor` / `--ensure-monitor` replaces that process. `degraded: true` with a fresh `last_completed_at` means the loop is alive but timeouts or errors are repeating; that does not by itself kill the process.
-+
-+## Rollback
-+
-+```sh
-+PID=$(cat "$STATE/monitor.pid" 2>/dev/null || true)
-+if [ -n "$PID" ]; then kill -TERM "$PID" || kill -KILL "$PID"; fi
-+cp -a /tmp/grok-wechat-pre-longpoll/ilink.js "$PLUGIN/server/ilink.js"
-+cp -a /tmp/grok-wechat-pre-longpoll/index.js "$PLUGIN/server/index.js"
-+cp -a /tmp/grok-wechat-pre-longpoll/store.js "$PLUGIN/server/store.js"
-+cp -a /tmp/grok-wechat-pre-longpoll/uninstall.js "$PLUGIN/server/uninstall.js"
-+rm -f "$PLUGIN/server/bounded-request.js"
-+cd "$PLUGIN" && node server/index.js --ensure-monitor
-+```
-+
-+Leave `account.json`, `inbox.jsonl`, `wake.json`, and `media/` as they are. Extra fields written by this build (`seenMessageIds`, `longPollTimeoutMs`, `monitor-health.json`) are ignored by the previous code. Restoring the state backup is only needed if you want to undo a cursor movement that happened after the new monitor started; that also drops messages received after the backup.
-+
-+## Do not
-+
-+- Run a second manual `getUpdates` or another monitor against the same account while the installed monitor is up.
-+- Point this plugin at a proxy other than the one the host already injects.
-+- Merge this into the upstream `little-thing/grok-wechat-plugin` from this fork unless that is requested separately.
 diff --git a/server/bounded-request.js b/server/bounded-request.js
 new file mode 100644
 index 0000000..7eb59bf
@@ -223,18 +120,18 @@ index 0000000..7eb59bf
 +  });
 +}
 diff --git a/server/ilink.js b/server/ilink.js
-index 91e6344..1212a3f 100644
+index 313d048..bc0396c 100644
 --- a/server/ilink.js
 +++ b/server/ilink.js
-@@ -4,6 +4,7 @@ import fs from "node:fs";
- import https from "node:https";
- import { BlockList, isIP } from "node:net";
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ import fs from "node:fs";
  import path from "node:path";
 +import { boundedRequest, isRequestTimeout } from "./bounded-request.js";
  import {
    contextFor,
    emptyAccount,
-@@ -30,9 +31,18 @@ const ILINK_APP_ID = "bot";
+@@ -27,9 +28,18 @@ const ILINK_APP_ID = "bot";
  const ILINK_APP_CLIENT_VERSION = ((1 & 0xff) << 16) | ((0 & 0xff) << 8) | (0 & 0xff);
  const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
  const LONG_POLL_MS = 35_000;
@@ -250,10 +147,10 @@ index 91e6344..1212a3f 100644
 +const longPollHints = new Map();
 +const longPollInflight = new Map();
 +
- const WAKE_URL = /^https:\/\/api2\.cursor\.sh\/automations\/webhook\/[A-Za-z0-9_-]+$/;
- const WAKE_TIMEOUT_MS = 5_000;
- const WAKE_MAX_HEADER_BYTES = 16 * 1024;
-@@ -249,34 +259,175 @@ export async function notifyStop(account) {
+ export const ITEM = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 };
+ export const MSG_TYPE = { USER: 1, BOT: 2 };
+ export const MSG_STATE = { NEW: 0, GENERATING: 1, FINISH: 2 };
+@@ -225,34 +235,175 @@ export async function notifyStop(account) {
    }
  }
  
@@ -449,7 +346,7 @@ index 91e6344..1212a3f 100644
  }
  
  function parseAesKey(raw) {
-@@ -302,19 +453,33 @@ function paddedSize(n) {
+@@ -278,19 +429,33 @@ function paddedSize(n) {
    return Math.ceil((n + 1) / 16) * 16;
  }
  
@@ -469,8 +366,8 @@ index 91e6344..1212a3f 100644
 -  const cipher = Buffer.from(await res.arrayBuffer());
 -  const key = parseAesKey(media.aes_key);
 -  const plain = aesEcb(cipher, key, "decrypt");
--  const file = mediaFilePath(ensureMediaDirectory(), label);
--  fs.writeFileSync(file, plain, { mode: 0o600 });
+-  const file = path.join(paths().media, `${Date.now()}-${label}`);
+-  fs.writeFileSync(file, plain);
 -  return file;
 +  const controller = new AbortController();
 +  const timer = setTimeout(() => controller.abort(), mediaTimeoutMs());
@@ -481,8 +378,8 @@ index 91e6344..1212a3f 100644
 +    const cipher = Buffer.from(await res.arrayBuffer());
 +    const key = parseAesKey(media.aes_key);
 +    const plain = aesEcb(cipher, key, "decrypt");
-+    const file = mediaFilePath(ensureMediaDirectory(), label);
-+    fs.writeFileSync(file, plain, { mode: 0o600 });
++    const file = path.join(paths().media, `${Date.now()}-${label}`);
++    fs.writeFileSync(file, plain);
 +    return file;
 +  } finally {
 +    clearTimeout(timer);
@@ -490,8 +387,8 @@ index 91e6344..1212a3f 100644
 +  }
  }
  
- /** 入站文件名来自对端，只保留 basename，防止 `../` 写出 media 目录。 */
-@@ -370,11 +535,15 @@ export async function normalizeInbound(msg) {
+ function itemText(item) {
+@@ -333,11 +498,15 @@ export async function normalizeInbound(msg) {
    };
  }
  
@@ -509,16 +406,16 @@ index 91e6344..1212a3f 100644
      if (!normalized.from_user_id) continue;
      updateState((s) => {
 diff --git a/server/index.js b/server/index.js
-index 5d0ead1..a25bdfc 100644
+index 0db3434..1735e8e 100644
 --- a/server/index.js
 +++ b/server/index.js
-@@ -4,25 +4,32 @@ import fs from "node:fs";
+@@ -4,24 +4,32 @@ import fs from "node:fs";
  import { fileURLToPath } from "node:url";
  import {
    appendInbox,
--  clearPid,
 +  assessMonitorHealth,
 +  clearOwnPid,
+   clearPid,
    drainInbox,
    findAccount,
    isAllowed,
@@ -530,7 +427,6 @@ index 5d0ead1..a25bdfc 100644
 +  readMonitorHealth,
    removeAccount,
    resolveWakeForAccount,
-   stopMonitorProcess,
    updateState,
 +  writeMonitorHealth,
    writePid,
@@ -546,11 +442,13 @@ index 5d0ead1..a25bdfc 100644
    notifyStart,
    notifyStop,
    sendMedia,
-@@ -62,10 +69,18 @@ async function sleep(ms) {
+@@ -60,9 +68,17 @@ async function sleep(ms) {
    await new Promise((r) => setTimeout(r, ms));
  }
  
 -function ensureMonitor() {
+-  const existing = monitorRunning();
+-  if (existing) return { already_running: true, pid: existing };
 +function waitDead(pid, timeoutMs) {
 +  const deadline = Date.now() + timeoutMs;
 +  const gate = new Int32Array(new SharedArrayBuffer(4));
@@ -563,12 +461,9 @@ index 5d0ead1..a25bdfc 100644
 +
 +function spawnMonitor() {
    const accounts = listAccounts();
--  const existing = monitorRunning();
--  if (existing) return { already_running: true, pid: existing };
    if (!accounts.length) return { started: false, reason: "not_logged_in" };
    const child = spawn(process.execPath, [self, "--monitor"], {
-     detached: true,
-@@ -77,6 +92,51 @@ function ensureMonitor() {
+@@ -75,6 +91,51 @@ function ensureMonitor() {
    return { started: true, pid: child.pid, account_count: accounts.length };
  }
  
@@ -617,10 +512,10 @@ index 5d0ead1..a25bdfc 100644
 +  };
 +}
 +
- function startMonitorOnConnect() {
-   try {
-     ensureMonitor();
-@@ -117,6 +177,7 @@ const tools = {
+ const accountRefSchema = {
+   ilink_bot_id: { type: "string", description: "指定要操作的已绑定微信账号 bot id" },
+   ilink_user_id: { type: "string", description: "指定要操作的已绑定微信 user id" },
+@@ -107,6 +168,7 @@ const tools = {
      handle: async () => {
        const payload = statusPayload();
        payload.monitor_pid = monitorRunning();
@@ -628,7 +523,7 @@ index 5d0ead1..a25bdfc 100644
        return ok(payload);
      },
    },
-@@ -419,16 +480,117 @@ async function wakeAgent(messages, log) {
+@@ -413,16 +475,118 @@ async function wakeAgent(messages, log) {
    }
  }
  
@@ -657,7 +552,8 @@ index 5d0ead1..a25bdfc 100644
 +}
 +
 +function restartAfterOverdue(log) {
-+  log("poll outcome=overdue action=restart");
++  const line = "poll outcome=overdue action=restart";
++  log(line);
 +  try {
 +    const child = spawn(process.execPath, [self, "--monitor"], {
 +      detached: true,
@@ -755,7 +651,7 @@ index 5d0ead1..a25bdfc 100644
  }
  
  async function runMonitor() {
-@@ -436,13 +598,21 @@ async function runMonitor() {
+@@ -430,13 +594,21 @@ async function runMonitor() {
    const log = (line) => {
      logStream.write(`${new Date().toISOString()} ${line}\n`);
    };
@@ -772,14 +668,14 @@ index 5d0ead1..a25bdfc 100644
    const accounts = listAccounts();
    await Promise.all(accounts.map((a) => notifyStart(a)));
    const onExit = async () => {
-     const current = listAccounts(loadState({ createHome: false }));
+     const current = listAccounts();
      await Promise.all(current.map((a) => notifyStop(a)));
 -    clearPid();
 +    clearOwnPid();
      process.exit(0);
    };
    process.on("SIGTERM", onExit);
-@@ -453,24 +623,49 @@ async function runMonitor() {
+@@ -452,24 +624,49 @@ async function runMonitor() {
        const accountsNow = listAccounts();
        if (!accountsNow.length) {
          log("no accounts, stopping");
@@ -839,10 +735,10 @@ index 5d0ead1..a25bdfc 100644
    }
  }
 diff --git a/server/store.js b/server/store.js
-index 71ddb58..ce16659 100644
+index a8346f5..45ec425 100644
 --- a/server/store.js
 +++ b/server/store.js
-@@ -23,6 +23,7 @@ export function paths() {
+@@ -20,6 +20,7 @@ export function paths() {
      pid: path.join(home, "monitor.pid"),
      media: path.join(home, "media"),
      log: path.join(home, "monitor.log"),
@@ -850,7 +746,7 @@ index 71ddb58..ce16659 100644
    };
  }
  
-@@ -360,6 +361,46 @@ export function clearPid() {
+@@ -250,6 +251,60 @@ export function clearPid() {
    if (fs.existsSync(pid)) fs.unlinkSync(pid);
  }
  
@@ -860,14 +756,28 @@ index 71ddb58..ce16659 100644
 +
 +export function writeMonitorHealth(snapshot) {
 +  ensureHome();
-+  writePrivateJson(paths().health, snapshot);
++  const file = paths().health;
++  const tmp = `${file}.${process.pid}.tmp`;
++  const fd = fs.openSync(tmp, "w", 0o600);
++  try {
++    fs.writeFileSync(fd, JSON.stringify(snapshot));
++    fs.fchmodSync(fd, 0o600);
++  } finally {
++    fs.closeSync(fd);
++  }
++  fs.renameSync(tmp, file);
 +}
 +
 +export function readMonitorHealth() {
-+  if (!checkStateHome(homeDir())) return null;
-+  const raw = readCredential(paths().health);
-+  if (!raw || raw.v !== 1) return null;
-+  return raw;
++  const file = paths().health;
++  if (!fs.existsSync(file)) return null;
++  try {
++    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
++    if (!raw || raw.v !== 1) return null;
++    return raw;
++  } catch {
++    return null;
++  }
 +}
 +
 +export function assessMonitorHealth(health, now = Date.now()) {
@@ -895,7 +805,7 @@ index 71ddb58..ce16659 100644
 +}
 +
  export function isPidAlive(pid) {
-   if (!Number.isInteger(pid) || pid <= 0) return false;
+   if (!pid) return false;
    try {
 diff --git a/server/test/longpoll.test.js b/server/test/longpoll.test.js
 new file mode 100644
@@ -1470,16 +1380,3 @@ index 0000000..84355c0
 +  const duration = Date.now() - started;
 +  assert.ok(duration < 1_000, `body stall lasted ${duration}ms`);
 +});
-diff --git a/server/uninstall.js b/server/uninstall.js
-index f97d0f2..4bd6b23 100644
---- a/server/uninstall.js
-+++ b/server/uninstall.js
-@@ -10,7 +10,7 @@ import { homeDir, isMonitorProcess, listAccounts, loadState, monitorEntryPath }
- const GROK_BOX_HOME = "/home/box";
- const PLUGIN_NAME = "grok-wechat-plugin";
- const STATE_FILES = [
--  "inbox.jsonl", "monitor.pid", "monitor.log",
-+  "inbox.jsonl", "monitor.pid", "monitor.log", "monitor-health.json",
-   "ensure-monitor.sh", "connector-active",
- ];
- const CREDENTIAL_TEMP = /^(?:account|wake)\.json\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/;
