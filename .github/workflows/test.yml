@@ -1,0 +1,31 @@
+name: test
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  current-tree:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.4"
+      - name: Test the branch tree
+        working-directory: server
+        run: node --test test/*.test.js
+
+  backport-5c02e41:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.4"
+      - name: Apply the 5c02e41 patch in a temp tree and test it
+        env:
+          NODE: node
+        run: sh deploy/check-5c02e41.sh

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import https from "node:https";
 import { BlockList, isIP } from "node:net";
 import path from "node:path";
+import { boundedRequest, isRequestTimeout } from "./bounded-request.js";
 import {
   contextFor,
   emptyAccount,
@@ -30,8 +31,17 @@ const ILINK_APP_ID = "bot";
 const ILINK_APP_CLIENT_VERSION = ((1 & 0xff) << 16) | ((0 & 0xff) << 8) | (0 & 0xff);
 const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
 const LONG_POLL_MS = 35_000;
+const MIN_LONG_POLL_MS = 5_000;
+const MAX_LONG_POLL_MS = 120_000;
+const MAX_DEADLINE_MS = 130_000;
+const TIMEOUT_SETTLE_MS = 150;
+const SEEN_ID_LIMIT = 300;
+const MEDIA_TIMEOUT_MS = 30_000;
 const API_TIMEOUT_MS = 15_000;
 const ERR_SESSION_EXPIRED = -14;
+
+const longPollHints = new Map();
+const longPollInflight = new Map();
 
 const WAKE_URL = /^https:\/\/api2\.cursor\.sh\/automations\/webhook\/[A-Za-z0-9_-]+$/;
 const WAKE_TIMEOUT_MS = 5_000;
@@ -249,34 +259,175 @@ export async function notifyStop(account) {
   }
 }
 
-export async function getUpdates(account) {
-  let data;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function testPollCap() {
+  const n = Number(process.env.GROK_WECHAT_POLL_BUDGET_MS);
+  if (Number.isFinite(n) && n >= 200 && n <= MAX_LONG_POLL_MS) return n;
+  return null;
+}
+
+export function longPollBudget(hintMs) {
+  const cap = testPollCap();
+  const max = cap ?? MAX_LONG_POLL_MS;
+  const min = cap ? Math.min(200, cap) : MIN_LONG_POLL_MS;
+  const fallback = cap ?? LONG_POLL_MS;
+  const raw = Number(hintMs);
+  const requested = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  const holdMs = Math.min(max, Math.max(min, Math.round(requested)));
+  const graceMs = Math.min(8_000, Math.max(250, Math.round(holdMs * 0.15)));
+  return { holdMs, graceMs, deadlineMs: Math.min(MAX_DEADLINE_MS, holdMs + graceMs) };
+}
+
+function pollKey(account) {
+  const id = account?.ilinkBotId || "";
+  const token = account?.token || "";
+  const hash = token ? crypto.createHash("sha256").update(token).digest("hex").slice(0, 12) : "";
+  return `${id}:${hash}`;
+}
+
+function activeHint(account) {
+  const key = pollKey(account);
+  if (longPollHints.has(key)) return longPollHints.get(key);
+  const saved = Number(account?.longPollTimeoutMs);
+  return Number.isFinite(saved) && saved > 0 ? saved : undefined;
+}
+
+export function longPollDeadlineMs(account) {
+  return longPollBudget(activeHint(account)).deadlineMs;
+}
+
+function rememberHint(account, suggestedMs) {
+  const holdMs = longPollBudget(suggestedMs).holdMs;
+  longPollHints.set(pollKey(account), holdMs);
+  return holdMs;
+}
+
+export function resetLongPollState() {
+  longPollHints.clear();
+  longPollInflight.clear();
+}
+
+export function messageKey(message) {
+  const id = message?.message_id ?? message?.client_id;
+  if (id === undefined || id === null || id === "") return "";
+  return String(id);
+}
+
+export function commitInboundCursor(account, { getUpdatesBuf, seenIds, longPollTimeoutMs } = {}) {
+  updateState((s) => {
+    const hit = findAccount(s, { token: account.token, ilink_bot_id: account.ilinkBotId });
+    if (!hit) return s;
+    if (typeof getUpdatesBuf === "string" && getUpdatesBuf.length > 0) hit.getUpdatesBuf = getUpdatesBuf;
+    if (Number.isFinite(Number(longPollTimeoutMs)) && Number(longPollTimeoutMs) > 0) {
+      hit.longPollTimeoutMs = Number(longPollTimeoutMs);
+    }
+    if (Array.isArray(seenIds) && seenIds.length) {
+      const prev = Array.isArray(hit.seenMessageIds) ? hit.seenMessageIds.map(String) : [];
+      hit.seenMessageIds = prev.concat(seenIds.map(String).filter(Boolean)).slice(-SEEN_ID_LIMIT);
+    }
+    return s;
+  });
+}
+
+async function getUpdatesOnce(account) {
+  const budget = longPollBudget(activeHint(account));
+  const started = Date.now();
+  let result;
   try {
-    data = await apiPost(
-      account.baseUrl,
-      "ilink/bot/getupdates",
-      { get_updates_buf: account.getUpdatesBuf || "" },
-      account.token,
-      LONG_POLL_MS + 5_000,
-    );
+    result = await boundedRequest(joinUrl(account.baseUrl, "ilink/bot/getupdates"), {
+      method: "POST",
+      headers: postHeaders(account.token),
+      body: JSON.stringify({
+        get_updates_buf: account.getUpdatesBuf || "",
+        base_info: baseInfo(),
+      }),
+      timeoutMs: budget.deadlineMs,
+    });
   } catch (err) {
-    if (err?.name === "AbortError") {
-      return { ret: 0, msgs: [], session_expired: false };
+    if (isRequestTimeout(err)) {
+      await sleep(TIMEOUT_SETTLE_MS);
+      return {
+        ret: 0,
+        msgs: [],
+        session_expired: false,
+        outcome: "timeout",
+        commit: false,
+        duration_ms: Date.now() - started,
+        deadline_ms: budget.deadlineMs,
+      };
     }
     throw err;
   }
+  let data;
+  try {
+    data = JSON.parse(result.buffer.toString("utf8"));
+  } catch {
+    const err = new Error("getupdates response was not json");
+    err.code = "BAD_RESPONSE";
+    throw err;
+  }
+  const duration_ms = Date.now() - started;
   if (data.errcode === ERR_SESSION_EXPIRED || data.ret === ERR_SESSION_EXPIRED) {
-    return { ret: data.ret ?? 0, msgs: [], session_expired: true };
+    return {
+      ret: data.ret ?? 0,
+      errcode: data.errcode,
+      msgs: [],
+      session_expired: true,
+      outcome: "expired",
+      commit: false,
+      duration_ms,
+      deadline_ms: budget.deadlineMs,
+    };
   }
-  if (typeof data.get_updates_buf === "string") {
-    updateState((s) => {
-      const hit = findAccount(s, { token: account.token });
-      if (hit) hit.getUpdatesBuf = data.get_updates_buf;
-      return s;
-    });
-    account.getUpdatesBuf = data.get_updates_buf;
+  const ret = data.ret ?? 0;
+  const errcode = data.errcode ?? 0;
+  if (ret !== 0 || errcode !== 0) {
+    const err = new Error("getupdates rejected");
+    err.code = "ILINK_RET";
+    err.ret = ret;
+    err.errcode = errcode;
+    throw err;
   }
-  return { ...data, session_expired: false };
+  const suggested = Number(data.longpolling_timeout_ms);
+  const longPollTimeoutMs = Number.isFinite(suggested) && suggested > 0
+    ? rememberHint(account, suggested)
+    : longPollBudget(activeHint(account)).holdMs;
+  const msgs = Array.isArray(data.msgs) ? data.msgs : [];
+  return {
+    ...data,
+    msgs,
+    session_expired: false,
+    outcome: msgs.length ? "messages" : "empty",
+    commit: true,
+    duration_ms,
+    deadline_ms: budget.deadlineMs,
+    longPollTimeoutMs,
+  };
+}
+
+export async function getUpdates(account) {
+  const key = pollKey(account);
+  if (longPollInflight.has(key)) {
+    return {
+      ret: 0,
+      msgs: [],
+      session_expired: false,
+      outcome: "busy",
+      commit: false,
+      duration_ms: 0,
+      deadline_ms: longPollDeadlineMs(account),
+    };
+  }
+  const run = getUpdatesOnce(account);
+  longPollInflight.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (longPollInflight.get(key) === run) longPollInflight.delete(key);
+  }
 }
 
 function parseAesKey(raw) {
@@ -302,19 +453,33 @@ function paddedSize(n) {
   return Math.ceil((n + 1) / 16) * 16;
 }
 
+function mediaTimeoutMs() {
+  const n = Number(process.env.GROK_WECHAT_MEDIA_TIMEOUT_MS);
+  if (Number.isFinite(n) && n >= 200 && n <= 60_000) return n;
+  return MEDIA_TIMEOUT_MS;
+}
+
 async function downloadMedia(media, label) {
   const param = media?.encrypt_query_param || "";
   const fullUrl = media?.full_url || "";
   if (!param && !fullUrl) return null;
   const url = fullUrl || `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
-  const cipher = Buffer.from(await res.arrayBuffer());
-  const key = parseAesKey(media.aes_key);
-  const plain = aesEcb(cipher, key, "decrypt");
-  const file = mediaFilePath(ensureMediaDirectory(), label);
-  fs.writeFileSync(file, plain, { mode: 0o600 });
-  return file;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), mediaTimeoutMs());
+  let res;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
+    const cipher = Buffer.from(await res.arrayBuffer());
+    const key = parseAesKey(media.aes_key);
+    const plain = aesEcb(cipher, key, "decrypt");
+    const file = mediaFilePath(ensureMediaDirectory(), label);
+    fs.writeFileSync(file, plain, { mode: 0o600 });
+    return file;
+  } finally {
+    clearTimeout(timer);
+    try { await res?.body?.cancel(); } catch { /* already consumed or closed */ }
+  }
 }
 
 /** 入站文件名来自对端，只保留 basename，防止 `../` 写出 media 目录。 */
@@ -370,11 +535,15 @@ export async function normalizeInbound(msg) {
   };
 }
 
-export async function collectInbound(rawMsgs, account) {
+export async function collectInbound(rawMsgs, account, seenIds) {
+  const seen = seenIds instanceof Set ? seenIds : new Set(seenIds || []);
   const out = [];
   for (const msg of rawMsgs || []) {
     if (msg.message_type && msg.message_type !== MSG_TYPE.USER) continue;
     if (msg.message_state && msg.message_state !== MSG_STATE.FINISH) continue;
+    const key = messageKey(msg);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
     const normalized = await normalizeInbound(msg);
     if (!normalized.from_user_id) continue;
     updateState((s) => {

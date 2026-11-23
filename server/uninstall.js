@@ -10,7 +10,7 @@ import { homeDir, isMonitorProcess, listAccounts, loadState, monitorEntryPath } 
 const GROK_BOX_HOME = "/home/box";
 const PLUGIN_NAME = "grok-wechat-plugin";
 const STATE_FILES = [
-  "inbox.jsonl", "monitor.pid", "monitor.log",
+  "inbox.jsonl", "monitor.pid", "monitor.log", "monitor-health.json",
   "ensure-monitor.sh", "connector-active",
 ];
 const CREDENTIAL_TEMP = /^(?:account|wake)\.json\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/;

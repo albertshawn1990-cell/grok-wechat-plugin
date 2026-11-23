@@ -1,0 +1,1382 @@
+diff --git a/server/bounded-request.js b/server/bounded-request.js
+new file mode 100644
+index 0000000..7eb59bf
+--- /dev/null
++++ b/server/bounded-request.js
+@@ -0,0 +1,115 @@
++import http from "node:http";
++import https from "node:https";
++import zlib from "node:zlib";
++
++const MAX_BYTES = 8 * 1024 * 1024;
++
++function decodeBody(buffer, encoding) {
++  const value = String(encoding || "").trim().toLowerCase();
++  if (!value || value === "identity") return buffer;
++  if (value === "gzip" || value === "x-gzip") return zlib.gunzipSync(buffer);
++  if (value === "deflate") return zlib.inflateSync(buffer);
++  if (value === "br") return zlib.brotliDecompressSync(buffer);
++  throw Object.assign(new Error("unsupported content encoding"), { code: "CONTENT_ENCODING" });
++}
++
++function timeoutError() {
++  return Object.assign(new Error("request timeout"), { name: "TimeoutError", code: "TIMEOUT" });
++}
++
++export function isRequestTimeout(err) {
++  const name = err?.name;
++  const code = err?.code;
++  return name === "TimeoutError"
++    || name === "AbortError"
++    || code === "TIMEOUT"
++    || code === "ABORT_ERR"
++    || code === 20
++    || code === "UND_ERR_HEADERS_TIMEOUT"
++    || code === "UND_ERR_BODY_TIMEOUT"
++    || code === "UND_ERR_CONNECT_TIMEOUT";
++}
++
++// Absolute deadline for both response headers and body. The global http(s)
++// agent is left in place so NODE_USE_ENV_PROXY still selects managed egress.
++// Do not pass a custom agent or agent:false here.
++export function boundedRequest(url, { method = "GET", headers = {}, body = null, timeoutMs } = {}) {
++  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
++    return Promise.reject(Object.assign(new Error("invalid timeout"), { code: "INVALID_TIMEOUT" }));
++  }
++  const target = new URL(url);
++  if (target.protocol !== "http:" && target.protocol !== "https:") {
++    return Promise.reject(Object.assign(new Error("unsupported protocol"), { code: "UNSUPPORTED_PROTOCOL" }));
++  }
++  const lib = target.protocol === "https:" ? https : http;
++  const payload = body == null ? null : Buffer.isBuffer(body) ? body : Buffer.from(String(body));
++  return new Promise((resolve, reject) => {
++    let settled = false;
++    let response = null;
++    let timedOut = false;
++    const finish = (err, value) => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(absolute);
++      if (err) reject(err);
++      else resolve(value);
++    };
++    const failTimeout = () => {
++      if (settled || timedOut) return;
++      timedOut = true;
++      const err = timeoutError();
++      response?.destroy(err);
++      req.destroy(err);
++    };
++    const absolute = setTimeout(failTimeout, timeoutMs);
++    const req = lib.request({
++      hostname: target.hostname,
++      port: target.port || undefined,
++      path: `${target.pathname}${target.search}`,
++      method,
++      headers: payload
++        ? { ...headers, "Content-Length": String(payload.length) }
++        : headers,
++    }, (res) => {
++      response = res;
++      const chunks = [];
++      let total = 0;
++      res.on("data", (chunk) => {
++        total += chunk.length;
++        if (total > MAX_BYTES) {
++          const err = Object.assign(new Error("response too large"), { code: "RESPONSE_TOO_LARGE" });
++          res.destroy(err);
++          req.destroy(err);
++          return;
++        }
++        chunks.push(chunk);
++      });
++      res.on("end", () => {
++        if (timedOut) {
++          finish(timeoutError());
++          return;
++        }
++        const status = res.statusCode || 0;
++        if (status < 200 || status >= 300) {
++          finish(Object.assign(new Error(`HTTP ${status}`), { code: "HTTP_STATUS", status }));
++          return;
++        }
++        let buffer;
++        try {
++          buffer = decodeBody(Buffer.concat(chunks), res.headers["content-encoding"]);
++        } catch (err) {
++          finish(err.code === "CONTENT_ENCODING" ? err : Object.assign(err, { code: err.code || "CONTENT_ENCODING" }));
++          return;
++        }
++        finish(null, { status, headers: res.headers, buffer });
++      });
++      res.on("error", (err) => finish(timedOut ? timeoutError() : err));
++      res.on("aborted", () => finish(timeoutError()));
++    });
++    req.on("error", (err) => finish(timedOut || isRequestTimeout(err) ? timeoutError() : err));
++    req.on("timeout", failTimeout);
++    req.setTimeout(timeoutMs);
++    if (payload) req.end(payload);
++    else req.end();
++  });
++}
+diff --git a/server/ilink.js b/server/ilink.js
+index 313d048..bc0396c 100644
+--- a/server/ilink.js
++++ b/server/ilink.js
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ import fs from "node:fs";
+ import path from "node:path";
++import { boundedRequest, isRequestTimeout } from "./bounded-request.js";
+ import {
+   contextFor,
+   emptyAccount,
+@@ -27,9 +28,18 @@ const ILINK_APP_ID = "bot";
+ const ILINK_APP_CLIENT_VERSION = ((1 & 0xff) << 16) | ((0 & 0xff) << 8) | (0 & 0xff);
+ const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
+ const LONG_POLL_MS = 35_000;
++const MIN_LONG_POLL_MS = 5_000;
++const MAX_LONG_POLL_MS = 120_000;
++const MAX_DEADLINE_MS = 130_000;
++const TIMEOUT_SETTLE_MS = 150;
++const SEEN_ID_LIMIT = 300;
++const MEDIA_TIMEOUT_MS = 30_000;
+ const API_TIMEOUT_MS = 15_000;
+ const ERR_SESSION_EXPIRED = -14;
+ 
++const longPollHints = new Map();
++const longPollInflight = new Map();
++
+ export const ITEM = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 };
+ export const MSG_TYPE = { USER: 1, BOT: 2 };
+ export const MSG_STATE = { NEW: 0, GENERATING: 1, FINISH: 2 };
+@@ -225,34 +235,175 @@ export async function notifyStop(account) {
+   }
+ }
+ 
+-export async function getUpdates(account) {
+-  let data;
++function sleep(ms) {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++function testPollCap() {
++  const n = Number(process.env.GROK_WECHAT_POLL_BUDGET_MS);
++  if (Number.isFinite(n) && n >= 200 && n <= MAX_LONG_POLL_MS) return n;
++  return null;
++}
++
++export function longPollBudget(hintMs) {
++  const cap = testPollCap();
++  const max = cap ?? MAX_LONG_POLL_MS;
++  const min = cap ? Math.min(200, cap) : MIN_LONG_POLL_MS;
++  const fallback = cap ?? LONG_POLL_MS;
++  const raw = Number(hintMs);
++  const requested = Number.isFinite(raw) && raw > 0 ? raw : fallback;
++  const holdMs = Math.min(max, Math.max(min, Math.round(requested)));
++  const graceMs = Math.min(8_000, Math.max(250, Math.round(holdMs * 0.15)));
++  return { holdMs, graceMs, deadlineMs: Math.min(MAX_DEADLINE_MS, holdMs + graceMs) };
++}
++
++function pollKey(account) {
++  const id = account?.ilinkBotId || "";
++  const token = account?.token || "";
++  const hash = token ? crypto.createHash("sha256").update(token).digest("hex").slice(0, 12) : "";
++  return `${id}:${hash}`;
++}
++
++function activeHint(account) {
++  const key = pollKey(account);
++  if (longPollHints.has(key)) return longPollHints.get(key);
++  const saved = Number(account?.longPollTimeoutMs);
++  return Number.isFinite(saved) && saved > 0 ? saved : undefined;
++}
++
++export function longPollDeadlineMs(account) {
++  return longPollBudget(activeHint(account)).deadlineMs;
++}
++
++function rememberHint(account, suggestedMs) {
++  const holdMs = longPollBudget(suggestedMs).holdMs;
++  longPollHints.set(pollKey(account), holdMs);
++  return holdMs;
++}
++
++export function resetLongPollState() {
++  longPollHints.clear();
++  longPollInflight.clear();
++}
++
++export function messageKey(message) {
++  const id = message?.message_id ?? message?.client_id;
++  if (id === undefined || id === null || id === "") return "";
++  return String(id);
++}
++
++export function commitInboundCursor(account, { getUpdatesBuf, seenIds, longPollTimeoutMs } = {}) {
++  updateState((s) => {
++    const hit = findAccount(s, { token: account.token, ilink_bot_id: account.ilinkBotId });
++    if (!hit) return s;
++    if (typeof getUpdatesBuf === "string" && getUpdatesBuf.length > 0) hit.getUpdatesBuf = getUpdatesBuf;
++    if (Number.isFinite(Number(longPollTimeoutMs)) && Number(longPollTimeoutMs) > 0) {
++      hit.longPollTimeoutMs = Number(longPollTimeoutMs);
++    }
++    if (Array.isArray(seenIds) && seenIds.length) {
++      const prev = Array.isArray(hit.seenMessageIds) ? hit.seenMessageIds.map(String) : [];
++      hit.seenMessageIds = prev.concat(seenIds.map(String).filter(Boolean)).slice(-SEEN_ID_LIMIT);
++    }
++    return s;
++  });
++}
++
++async function getUpdatesOnce(account) {
++  const budget = longPollBudget(activeHint(account));
++  const started = Date.now();
++  let result;
+   try {
+-    data = await apiPost(
+-      account.baseUrl,
+-      "ilink/bot/getupdates",
+-      { get_updates_buf: account.getUpdatesBuf || "" },
+-      account.token,
+-      LONG_POLL_MS + 5_000,
+-    );
++    result = await boundedRequest(joinUrl(account.baseUrl, "ilink/bot/getupdates"), {
++      method: "POST",
++      headers: postHeaders(account.token),
++      body: JSON.stringify({
++        get_updates_buf: account.getUpdatesBuf || "",
++        base_info: baseInfo(),
++      }),
++      timeoutMs: budget.deadlineMs,
++    });
+   } catch (err) {
+-    if (err?.name === "AbortError") {
+-      return { ret: 0, msgs: [], session_expired: false };
++    if (isRequestTimeout(err)) {
++      await sleep(TIMEOUT_SETTLE_MS);
++      return {
++        ret: 0,
++        msgs: [],
++        session_expired: false,
++        outcome: "timeout",
++        commit: false,
++        duration_ms: Date.now() - started,
++        deadline_ms: budget.deadlineMs,
++      };
+     }
+     throw err;
+   }
++  let data;
++  try {
++    data = JSON.parse(result.buffer.toString("utf8"));
++  } catch {
++    const err = new Error("getupdates response was not json");
++    err.code = "BAD_RESPONSE";
++    throw err;
++  }
++  const duration_ms = Date.now() - started;
+   if (data.errcode === ERR_SESSION_EXPIRED || data.ret === ERR_SESSION_EXPIRED) {
+-    return { ret: data.ret ?? 0, msgs: [], session_expired: true };
++    return {
++      ret: data.ret ?? 0,
++      errcode: data.errcode,
++      msgs: [],
++      session_expired: true,
++      outcome: "expired",
++      commit: false,
++      duration_ms,
++      deadline_ms: budget.deadlineMs,
++    };
+   }
+-  if (typeof data.get_updates_buf === "string") {
+-    updateState((s) => {
+-      const hit = findAccount(s, { token: account.token });
+-      if (hit) hit.getUpdatesBuf = data.get_updates_buf;
+-      return s;
+-    });
+-    account.getUpdatesBuf = data.get_updates_buf;
++  const ret = data.ret ?? 0;
++  const errcode = data.errcode ?? 0;
++  if (ret !== 0 || errcode !== 0) {
++    const err = new Error("getupdates rejected");
++    err.code = "ILINK_RET";
++    err.ret = ret;
++    err.errcode = errcode;
++    throw err;
++  }
++  const suggested = Number(data.longpolling_timeout_ms);
++  const longPollTimeoutMs = Number.isFinite(suggested) && suggested > 0
++    ? rememberHint(account, suggested)
++    : longPollBudget(activeHint(account)).holdMs;
++  const msgs = Array.isArray(data.msgs) ? data.msgs : [];
++  return {
++    ...data,
++    msgs,
++    session_expired: false,
++    outcome: msgs.length ? "messages" : "empty",
++    commit: true,
++    duration_ms,
++    deadline_ms: budget.deadlineMs,
++    longPollTimeoutMs,
++  };
++}
++
++export async function getUpdates(account) {
++  const key = pollKey(account);
++  if (longPollInflight.has(key)) {
++    return {
++      ret: 0,
++      msgs: [],
++      session_expired: false,
++      outcome: "busy",
++      commit: false,
++      duration_ms: 0,
++      deadline_ms: longPollDeadlineMs(account),
++    };
++  }
++  const run = getUpdatesOnce(account);
++  longPollInflight.set(key, run);
++  try {
++    return await run;
++  } finally {
++    if (longPollInflight.get(key) === run) longPollInflight.delete(key);
+   }
+-  return { ...data, session_expired: false };
+ }
+ 
+ function parseAesKey(raw) {
+@@ -278,19 +429,33 @@ function paddedSize(n) {
+   return Math.ceil((n + 1) / 16) * 16;
+ }
+ 
++function mediaTimeoutMs() {
++  const n = Number(process.env.GROK_WECHAT_MEDIA_TIMEOUT_MS);
++  if (Number.isFinite(n) && n >= 200 && n <= 60_000) return n;
++  return MEDIA_TIMEOUT_MS;
++}
++
+ async function downloadMedia(media, label) {
+   const param = media?.encrypt_query_param || "";
+   const fullUrl = media?.full_url || "";
+   if (!param && !fullUrl) return null;
+   const url = fullUrl || `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
+-  const res = await fetch(url);
+-  if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
+-  const cipher = Buffer.from(await res.arrayBuffer());
+-  const key = parseAesKey(media.aes_key);
+-  const plain = aesEcb(cipher, key, "decrypt");
+-  const file = path.join(paths().media, `${Date.now()}-${label}`);
+-  fs.writeFileSync(file, plain);
+-  return file;
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), mediaTimeoutMs());
++  let res;
++  try {
++    res = await fetch(url, { signal: controller.signal });
++    if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
++    const cipher = Buffer.from(await res.arrayBuffer());
++    const key = parseAesKey(media.aes_key);
++    const plain = aesEcb(cipher, key, "decrypt");
++    const file = path.join(paths().media, `${Date.now()}-${label}`);
++    fs.writeFileSync(file, plain);
++    return file;
++  } finally {
++    clearTimeout(timer);
++    try { await res?.body?.cancel(); } catch { /* already consumed or closed */ }
++  }
+ }
+ 
+ function itemText(item) {
+@@ -333,11 +498,15 @@ export async function normalizeInbound(msg) {
+   };
+ }
+ 
+-export async function collectInbound(rawMsgs, account) {
++export async function collectInbound(rawMsgs, account, seenIds) {
++  const seen = seenIds instanceof Set ? seenIds : new Set(seenIds || []);
+   const out = [];
+   for (const msg of rawMsgs || []) {
+     if (msg.message_type && msg.message_type !== MSG_TYPE.USER) continue;
+     if (msg.message_state && msg.message_state !== MSG_STATE.FINISH) continue;
++    const key = messageKey(msg);
++    if (key && seen.has(key)) continue;
++    if (key) seen.add(key);
+     const normalized = await normalizeInbound(msg);
+     if (!normalized.from_user_id) continue;
+     updateState((s) => {
+diff --git a/server/index.js b/server/index.js
+index 0db3434..1735e8e 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -4,24 +4,32 @@ import fs from "node:fs";
+ import { fileURLToPath } from "node:url";
+ import {
+   appendInbox,
++  assessMonitorHealth,
++  clearOwnPid,
+   clearPid,
+   drainInbox,
+   findAccount,
+   isAllowed,
++  isPidAlive,
+   listAccounts,
+   loadState,
+   monitorRunning,
+   paths,
++  readMonitorHealth,
+   removeAccount,
+   resolveWakeForAccount,
+   updateState,
++  writeMonitorHealth,
+   writePid,
+ } from "./store.js";
+ import {
+   collectInbound,
++  commitInboundCursor,
+   getUpdates,
+   loginStart,
+   loginWait,
++  longPollDeadlineMs,
++  messageKey,
+   notifyStart,
+   notifyStop,
+   sendMedia,
+@@ -60,9 +68,17 @@ async function sleep(ms) {
+   await new Promise((r) => setTimeout(r, ms));
+ }
+ 
+-function ensureMonitor() {
+-  const existing = monitorRunning();
+-  if (existing) return { already_running: true, pid: existing };
++function waitDead(pid, timeoutMs) {
++  const deadline = Date.now() + timeoutMs;
++  const gate = new Int32Array(new SharedArrayBuffer(4));
++  while (Date.now() < deadline) {
++    if (!isPidAlive(pid)) return true;
++    Atomics.wait(gate, 0, 0, 50);
++  }
++  return !isPidAlive(pid);
++}
++
++function spawnMonitor() {
+   const accounts = listAccounts();
+   if (!accounts.length) return { started: false, reason: "not_logged_in" };
+   const child = spawn(process.execPath, [self, "--monitor"], {
+@@ -75,6 +91,51 @@ function ensureMonitor() {
+   return { started: true, pid: child.pid, account_count: accounts.length };
+ }
+ 
++function ensureMonitor() {
++  const existing = monitorRunning();
++  if (existing) {
++    const health = readMonitorHealth();
++    const verdict = health?.pid === existing
++      ? assessMonitorHealth(health)
++      : { stale: false, reason: "no-matching-health" };
++    if (!verdict.stale) return { already_running: true, pid: existing, stale: false };
++    try { process.kill(existing, "SIGTERM"); } catch { /* already gone */ }
++    if (!waitDead(existing, 3_000)) {
++      try { process.kill(existing, "SIGKILL"); } catch { /* already gone */ }
++      waitDead(existing, 1_000);
++    }
++    const started = spawnMonitor();
++    return { ...started, restarted: true, previous_pid: existing, stale_reason: verdict.reason };
++  }
++  return spawnMonitor();
++}
++
++function monitorHealthSummary() {
++  const health = readMonitorHealth();
++  if (!health) return null;
++  const verdict = assessMonitorHealth(health);
++  const accounts = Object.entries(health.accounts || {}).map(([bot, row]) => ({
++    ilink_bot_id: bot,
++    last_outcome: row.last_outcome || "",
++    last_completed_at: row.last_completed_at || null,
++    last_exchange_at: row.last_exchange_at || null,
++    last_message_at: row.last_message_at || null,
++    consecutive_timeouts: row.consecutive_timeouts || 0,
++    consecutive_errors: row.consecutive_errors || 0,
++    in_flight_ms: row.in_flight_since ? Math.max(0, Date.now() - row.in_flight_since) : 0,
++    deadline_ms: row.deadline_ms || 0,
++  }));
++  return {
++    stale: verdict.stale,
++    stale_reason: verdict.reason,
++    degraded: accounts.some((row) => row.consecutive_timeouts >= 3 || row.consecutive_errors > 0),
++    pid: health.pid || 0,
++    started_at: health.started_at || null,
++    updated_at: health.updated_at || null,
++    accounts,
++  };
++}
++
+ const accountRefSchema = {
+   ilink_bot_id: { type: "string", description: "指定要操作的已绑定微信账号 bot id" },
+   ilink_user_id: { type: "string", description: "指定要操作的已绑定微信 user id" },
+@@ -107,6 +168,7 @@ const tools = {
+     handle: async () => {
+       const payload = statusPayload();
+       payload.monitor_pid = monitorRunning();
++      payload.monitor_health = monitorHealthSummary();
+       return ok(payload);
+     },
+   },
+@@ -413,16 +475,118 @@ async function wakeAgent(messages, log) {
+   }
+ }
+ 
+-async function pollAccount(account, log) {
+-  const raw = await getUpdates(account);
+-  if (raw.session_expired) {
+-    log(`session expired bot=${account.ilinkBotId}`);
+-    return { messages: [], expired: true };
++function botLabel(account) {
++  return String(account.ilinkBotId || "unknown").replace(/[\s\r\n]/g, "").slice(0, 80);
++}
++
++function configuredDelay(name, fallback) {
++  const n = Number(process.env[name]);
++  if (Number.isFinite(n) && n >= 0 && n < 120_000) return n;
++  return fallback;
++}
++
++function saveHealth(health) {
++  health.updated_at = Date.now();
++  try {
++    writeMonitorHealth(health);
++  } catch {
++    // Health is diagnostic. A write failure must not stop polling.
++  }
++}
++
++function restartAfterOverdue(log) {
++  const line = "poll outcome=overdue action=restart";
++  log(line);
++  try {
++    const child = spawn(process.execPath, [self, "--monitor"], {
++      detached: true,
++      stdio: "ignore",
++      env: process.env,
++    });
++    child.unref();
++    writePid(child.pid);
++    log(`monitor respawn pid=${child.pid}`);
++  } catch (err) {
++    log(`monitor respawn failed code=${err?.code || ""}`);
++  }
++  process.exit(1);
++}
++
++async function pollAccount(account, log, health) {
++  const bot = botLabel(account);
++  const row = health.accounts[bot] || {
++    last_completed_at: null,
++    last_exchange_at: null,
++    last_message_at: null,
++    last_outcome: "",
++    last_duration_ms: 0,
++    deadline_ms: 0,
++    consecutive_timeouts: 0,
++    consecutive_errors: 0,
++    in_flight_since: null,
++  };
++  health.accounts[bot] = row;
++  const started = Date.now();
++  const deadline = longPollDeadlineMs(account);
++  row.deadline_ms = deadline;
++  row.in_flight_since = started;
++  saveHealth(health);
++  let restarting = false;
++  const watchdog = setTimeout(() => {
++    restarting = true;
++    row.in_flight_since = started;
++    saveHealth(health);
++    restartAfterOverdue(log);
++  }, deadline + configuredDelay("GROK_WECHAT_WATCHDOG_SLACK_MS", 20_000));
++  try {
++    const raw = await getUpdates(account);
++    const outcome = raw.outcome || (raw.session_expired ? "expired" : "empty");
++    row.last_completed_at = Date.now();
++    row.last_outcome = outcome;
++    row.last_duration_ms = Number(raw.duration_ms) || (Date.now() - started);
++    row.deadline_ms = Number(raw.deadline_ms) || deadline;
++    row.in_flight_since = null;
++    if (outcome === "timeout") row.consecutive_timeouts += 1;
++    else if (outcome === "expired" || outcome === "empty" || outcome === "messages") {
++      row.consecutive_timeouts = 0;
++      row.consecutive_errors = 0;
++      if (outcome !== "expired") row.last_exchange_at = Date.now();
++    }
++    log(`poll outcome=${outcome} bot=${bot} duration_ms=${row.last_duration_ms} deadline_ms=${row.deadline_ms} msgs=${Array.isArray(raw.msgs) ? raw.msgs.length : 0} consecutive_timeouts=${row.consecutive_timeouts}`);
++    if (outcome === "timeout" || outcome === "busy") {
++      return { account, messages: [], expired: false, outcome, commit: false };
++    }
++    if (outcome === "expired" || raw.session_expired) {
++      return { account, messages: [], expired: true, outcome: "expired", commit: false };
++    }
++    const seen = new Set((account.seenMessageIds || []).map(String));
++    const collected = await collectInbound(raw.msgs || [], account, seen);
++    const state = loadState();
++    const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
++    if (allowed.length) row.last_message_at = Date.now();
++    row.last_outcome = allowed.length ? "messages" : "empty";
++    return {
++      account,
++      messages: allowed,
++      expired: false,
++      outcome: row.last_outcome,
++      commit: raw.commit === true,
++      get_updates_buf: raw.get_updates_buf,
++      seenIds: (raw.msgs || []).map(messageKey).filter(Boolean),
++      longPollTimeoutMs: raw.longPollTimeoutMs,
++    };
++  } catch (err) {
++    row.last_completed_at = Date.now();
++    row.in_flight_since = null;
++    row.last_outcome = "error";
++    row.consecutive_errors += 1;
++    row.last_duration_ms = Date.now() - started;
++    log(`poll outcome=error bot=${bot} name=${err?.name || "Error"} code=${err?.code || ""} ret=${err?.ret ?? ""} errcode=${err?.errcode ?? ""} consecutive_errors=${row.consecutive_errors}`);
++    throw err;
++  } finally {
++    clearTimeout(watchdog);
++    if (!restarting) saveHealth(health);
+   }
+-  const collected = await collectInbound(raw.msgs || [], account);
+-  const state = loadState();
+-  const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
+-  return { messages: allowed, expired: false };
+ }
+ 
+ async function runMonitor() {
+@@ -430,13 +594,21 @@ async function runMonitor() {
+   const log = (line) => {
+     logStream.write(`${new Date().toISOString()} ${line}\n`);
+   };
+-  log("monitor start");
++  log(`monitor start pid=${process.pid}`);
++  const health = {
++    v: 1,
++    pid: process.pid,
++    started_at: Date.now(),
++    updated_at: Date.now(),
++    accounts: {},
++  };
++  saveHealth(health);
+   const accounts = listAccounts();
+   await Promise.all(accounts.map((a) => notifyStart(a)));
+   const onExit = async () => {
+     const current = listAccounts();
+     await Promise.all(current.map((a) => notifyStop(a)));
+-    clearPid();
++    clearOwnPid();
+     process.exit(0);
+   };
+   process.on("SIGTERM", onExit);
+@@ -452,24 +624,49 @@ async function runMonitor() {
+       const accountsNow = listAccounts();
+       if (!accountsNow.length) {
+         log("no accounts, stopping");
+-        clearPid();
++        clearOwnPid();
+         process.exit(0);
+       }
+-      const results = await Promise.all(accountsNow.map((account) => pollAccount(account, log)));
+-      failures = 0;
+-      const batch = results.flatMap((r) => r.messages);
+-      if (results.some((r) => r.expired)) {
+-        await sleep(60_000);
++      const settled = await Promise.allSettled(accountsNow.map((account) => pollAccount(account, log, health)));
++      const results = [];
++      let errors = 0;
++      for (const item of settled) {
++        if (item.status === "fulfilled") results.push(item.value);
++        else errors += 1;
++      }
++      for (const result of results) {
++        if (result.messages.length) appendInbox(result.messages);
++        if (result.commit) {
++          commitInboundCursor(result.account, {
++            getUpdatesBuf: result.get_updates_buf,
++            seenIds: result.seenIds,
++            longPollTimeoutMs: result.longPollTimeoutMs,
++          });
++        }
++      }
++      const batch = results.flatMap((result) => result.messages);
++      if (errors === 0 && results.every((result) => result.outcome === "empty" || result.outcome === "messages")) {
++        failures = 0;
++      }
++      if (errors) {
++        failures += 1;
++        await sleep(failures >= 3
++          ? configuredDelay("GROK_WECHAT_BACKOFF_MS", 30_000)
++          : configuredDelay("GROK_WECHAT_RETRY_MS", 2_000));
++      }
++      if (results.some((result) => result.expired)) {
++        await sleep(configuredDelay("GROK_WECHAT_EXPIRED_MS", 60_000));
+       }
+       if (batch.length) {
+-        appendInbox(batch);
+         log(`inbox +${batch.length}`);
+         await wakeAgent(batch, log);
+       }
+     } catch (err) {
+       failures += 1;
+-      log(`getupdates error ${err instanceof Error ? err.message : String(err)}`);
+-      await sleep(failures >= 3 ? 30_000 : 2_000);
++      log(`poll outcome=error name=${err?.name || "Error"} code=${err?.code || ""}`);
++      await sleep(failures >= 3
++        ? configuredDelay("GROK_WECHAT_BACKOFF_MS", 30_000)
++        : configuredDelay("GROK_WECHAT_RETRY_MS", 2_000));
+     }
+   }
+ }
+diff --git a/server/store.js b/server/store.js
+index a8346f5..45ec425 100644
+--- a/server/store.js
++++ b/server/store.js
+@@ -20,6 +20,7 @@ export function paths() {
+     pid: path.join(home, "monitor.pid"),
+     media: path.join(home, "media"),
+     log: path.join(home, "monitor.log"),
++    health: path.join(home, "monitor-health.json"),
+   };
+ }
+ 
+@@ -250,6 +251,60 @@ export function clearPid() {
+   if (fs.existsSync(pid)) fs.unlinkSync(pid);
+ }
+ 
++export function clearOwnPid() {
++  if (readPid() === process.pid) clearPid();
++}
++
++export function writeMonitorHealth(snapshot) {
++  ensureHome();
++  const file = paths().health;
++  const tmp = `${file}.${process.pid}.tmp`;
++  const fd = fs.openSync(tmp, "w", 0o600);
++  try {
++    fs.writeFileSync(fd, JSON.stringify(snapshot));
++    fs.fchmodSync(fd, 0o600);
++  } finally {
++    fs.closeSync(fd);
++  }
++  fs.renameSync(tmp, file);
++}
++
++export function readMonitorHealth() {
++  const file = paths().health;
++  if (!fs.existsSync(file)) return null;
++  try {
++    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
++    if (!raw || raw.v !== 1) return null;
++    return raw;
++  } catch {
++    return null;
++  }
++}
++
++export function assessMonitorHealth(health, now = Date.now()) {
++  if (!health || health.v !== 1) return { stale: false, reason: "unknown" };
++  const rows = Object.values(health.accounts || {});
++  const startedAge = now - (Number(health.started_at) || now);
++  if (!rows.length) {
++    if (startedAge > 180_000) return { stale: true, reason: "no-progress" };
++    return { stale: false, reason: "starting" };
++  }
++  for (const row of rows) {
++    const deadline = Number(row.deadline_ms) > 0 ? Number(row.deadline_ms) : 45_000;
++    if (row.in_flight_since && now - Number(row.in_flight_since) > deadline + 15_000) {
++      return { stale: true, reason: "poll-overdue" };
++    }
++    const completed = Number(row.last_completed_at) || 0;
++    if (!row.in_flight_since && completed && now - completed > 180_000) {
++      return { stale: true, reason: "no-progress" };
++    }
++    if (!completed && startedAge > 180_000) {
++      return { stale: true, reason: "never-completed" };
++    }
++  }
++  return { stale: false, reason: "ok" };
++}
++
+ export function isPidAlive(pid) {
+   if (!pid) return false;
+   try {
+diff --git a/server/test/longpoll.test.js b/server/test/longpoll.test.js
+new file mode 100644
+index 0000000..84355c0
+--- /dev/null
++++ b/server/test/longpoll.test.js
+@@ -0,0 +1,567 @@
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import fs from "node:fs";
++import http from "node:http";
++import os from "node:os";
++import path from "node:path";
++import zlib from "node:zlib";
++import { test } from "node:test";
++import { fileURLToPath } from "node:url";
++import { boundedRequest } from "../bounded-request.js";
++import {
++  collectInbound,
++  commitInboundCursor,
++  getUpdates,
++  longPollBudget,
++  normalizeInbound,
++  resetLongPollState,
++} from "../ilink.js";
++import { assessMonitorHealth, emptyAccount, emptyState, loadState, paths, readPid, saveState, writePid } from "../store.js";
++
++const INDEX = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "index.js");
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++
++function userMessage(id, text = "hello") {
++  return {
++    message_type: 1,
++    message_state: 2,
++    from_user_id: "peer",
++    message_id: id,
++    create_time_ms: 1,
++    item_list: [{ type: 1, text_item: { text } }],
++  };
++}
++
++async function listen(server) {
++  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
++  server.unref();
++  return server.address().port;
++}
++
++function useHome(t) {
++  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "grok-wechat-longpoll-"));
++  const previous = process.env.GROK_WECHAT_HOME;
++  const previousBudget = process.env.GROK_WECHAT_POLL_BUDGET_MS;
++  process.env.GROK_WECHAT_HOME = home;
++  process.env.GROK_WECHAT_POLL_BUDGET_MS = "400";
++  resetLongPollState();
++  t.after(() => {
++    if (previous === undefined) delete process.env.GROK_WECHAT_HOME;
++    else process.env.GROK_WECHAT_HOME = previous;
++    if (previousBudget === undefined) delete process.env.GROK_WECHAT_POLL_BUDGET_MS;
++    else process.env.GROK_WECHAT_POLL_BUDGET_MS = previousBudget;
++    resetLongPollState();
++    for (let attempt = 0; attempt < 5; attempt += 1) {
++      try {
++        fs.rmSync(home, { recursive: true, force: true });
++        break;
++      } catch (err) {
++        if (attempt === 4) throw err;
++        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
++      }
++    }
++  });
++  return home;
++}
++
++function saveAccount(port, extra = {}) {
++  const account = {
++    ...emptyAccount(),
++    token: "test-token",
++    baseUrl: `http://127.0.0.1:${port}`,
++    ilinkBotId: "bot1",
++    ilinkUserId: "owner",
++    getUpdatesBuf: "cursor-1",
++    ...extra,
++  };
++  saveState({ ...emptyState(), accounts: [account] });
++  return account;
++}
++
++function trackGetUpdates(handler) {
++  let active = 0;
++  let maxActive = 0;
++  let overlapMs = 0;
++  let overlapAt = 0;
++  const sockets = new Set();
++  const server = http.createServer((req, res) => {
++    req.resume();
++    if (!req.url.includes("getupdates")) {
++      res.writeHead(200, { "content-type": "application/json" });
++      res.end("{}");
++      return;
++    }
++    active += 1;
++    if (active === 2) overlapAt = Date.now();
++    maxActive = Math.max(maxActive, active);
++    sockets.add(req.socket);
++    let left = false;
++    const leave = () => {
++      if (left) return;
++      left = true;
++      if (active >= 2 && overlapAt) {
++        overlapMs += Date.now() - overlapAt;
++        overlapAt = 0;
++      }
++      active = Math.max(0, active - 1);
++    };
++    req.on("close", leave);
++    res.on("close", leave);
++    handler(req, res, leave);
++  });
++  return {
++    server,
++    stats: () => ({
++      active,
++      maxActive,
++      overlapMs,
++      open: [...sockets].filter((socket) => !socket.destroyed).length,
++    }),
++  };
++}
++
++test("long-poll budget clamps an oversized server hint", () => {
++  const previous = process.env.GROK_WECHAT_POLL_BUDGET_MS;
++  delete process.env.GROK_WECHAT_POLL_BUDGET_MS;
++  try {
++    const huge = longPollBudget(600_000);
++    assert.equal(huge.holdMs, 120_000);
++    assert.ok(huge.deadlineMs <= 130_000);
++    assert.ok(huge.deadlineMs >= huge.holdMs);
++    const normal = longPollBudget(35_000);
++    assert.equal(normal.holdMs, 35_000);
++    assert.ok(normal.deadlineMs > 35_000);
++    assert.ok(normal.deadlineMs < 50_000);
++    assert.equal(longPollBudget(0).holdMs, 35_000);
++    assert.equal(longPollBudget(-5).holdMs, 35_000);
++  } finally {
++    if (previous === undefined) delete process.env.GROK_WECHAT_POLL_BUDGET_MS;
++    else process.env.GROK_WECHAT_POLL_BUDGET_MS = previous;
++  }
++});
++
++test("stalled headers time out, close the socket, and keep the cursor", async (t) => {
++  useHome(t);
++  const tracked = trackGetUpdates(() => {});
++  const port = await listen(tracked.server);
++  t.after(() => tracked.server.close());
++  saveAccount(port);
++  const started = Date.now();
++  const result = await getUpdates(loadState().accounts[0]);
++  const duration = Date.now() - started;
++  assert.equal(result.outcome, "timeout");
++  assert.equal(result.commit, false);
++  assert.ok(duration < 2_000, `timeout took ${duration}ms`);
++  assert.ok(duration >= 400, `timeout returned too soon (${duration}ms)`);
++  await sleep(100);
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-1");
++  assert.equal(tracked.stats().open, 0);
++  assert.equal(tracked.stats().maxActive, 1);
++});
++
++test("stalled response body times out after headers and closes the socket", async (t) => {
++  useHome(t);
++  const tracked = trackGetUpdates((_req, res) => {
++    res.writeHead(200, { "content-type": "application/json", "transfer-encoding": "chunked" });
++    res.write(" ");
++  });
++  const port = await listen(tracked.server);
++  t.after(() => tracked.server.close());
++  saveAccount(port);
++  const started = Date.now();
++  const result = await getUpdates(loadState().accounts[0]);
++  assert.equal(result.outcome, "timeout");
++  assert.equal(result.commit, false);
++  assert.ok(Date.now() - started < 2_000);
++  await sleep(100);
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-1");
++  assert.equal(tracked.stats().open, 0);
++});
++
++test("a second poll waits instead of overlapping the in-flight request", async (t) => {
++  useHome(t);
++  const tracked = trackGetUpdates(() => {});
++  const port = await listen(tracked.server);
++  t.after(() => tracked.server.close());
++  saveAccount(port);
++  const first = getUpdates(loadState().accounts[0]);
++  await sleep(40);
++  const second = await getUpdates(loadState().accounts[0]);
++  assert.equal(second.outcome, "busy");
++  assert.equal(second.commit, false);
++  assert.equal(tracked.stats().maxActive, 1);
++  const finished = await first;
++  assert.equal(finished.outcome, "timeout");
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-1");
++  assert.ok(tracked.stats().overlapMs < 200, `overlap ${tracked.stats().overlapMs}ms`);
++});
++
++test("empty polls stay distinct from transport and API errors", async (t) => {
++  useHome(t);
++  const script = [
++    { status: 200, body: { ret: 0, msgs: [], get_updates_buf: "cursor-1", longpolling_timeout_ms: 600_000 } },
++    { status: 500, body: "nope" },
++    { status: 200, body: { ret: 7, errcode: 7, msgs: [], get_updates_buf: "cursor-x" } },
++    { status: 200, body: "not-json" },
++  ];
++  const tracked = trackGetUpdates((_req, res) => {
++    const next = script.shift();
++    res.writeHead(next.status, { "content-type": "application/json" });
++    res.end(typeof next.body === "string" ? next.body : JSON.stringify(next.body));
++  });
++  const port = await listen(tracked.server);
++  t.after(() => tracked.server.close());
++  saveAccount(port);
++  const empty = await getUpdates(loadState().accounts[0]);
++  assert.equal(empty.outcome, "empty");
++  assert.equal(empty.commit, true);
++  assert.equal(empty.longPollTimeoutMs, 400);
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-1");
++  await assert.rejects(getUpdates(loadState().accounts[0]), /HTTP 500/);
++  await assert.rejects(getUpdates(loadState().accounts[0]), (err) => err.code === "ILINK_RET" && err.ret === 7);
++  await assert.rejects(getUpdates(loadState().accounts[0]), (err) => err.code === "BAD_RESPONSE");
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-1");
++  const held = trackGetUpdates((_req, res) => {
++    setTimeout(() => {
++      res.writeHead(200, { "content-type": "application/json" });
++      res.end(JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "cursor-1" }));
++    }, 2_000);
++  });
++  const heldPort = await listen(held.server);
++  t.after(() => held.server.close());
++  saveAccount(heldPort, { longPollTimeoutMs: 400 });
++  resetLongPollState();
++  const started = Date.now();
++  const timed = await getUpdates(loadState().accounts[0]);
++  assert.equal(timed.outcome, "timeout");
++  assert.ok(Date.now() - started < 1_500, "a clamped hint must not wait out the server's raw hold");
++});
++
++test("cursor commits after a stored message and duplicates are not collected again", async (t) => {
++  useHome(t);
++  const account = saveAccount(0);
++  account.baseUrl = "http://127.0.0.1:9";
++  const cursorBefore = loadState().accounts[0].getUpdatesBuf;
++  commitInboundCursor(account, {
++    getUpdatesBuf: "cursor-2",
++    seenIds: ["m-1"],
++    longPollTimeoutMs: 400,
++  });
++  const stored = loadState().accounts[0];
++  assert.equal(stored.getUpdatesBuf, "cursor-2");
++  assert.deepEqual(stored.seenMessageIds, ["m-1"]);
++  assert.equal(stored.longPollTimeoutMs, 400);
++  assert.notEqual(cursorBefore, "cursor-2");
++  const collected = await collectInbound([userMessage("m-1", "again"), userMessage("m-2", "next")], stored, stored.seenMessageIds);
++  assert.deepEqual(collected.messages.map((message) => message.message_id), ["m-2"]);
++});
++
++test("a stalled media download does not block the text already in the message", async (t) => {
++  useHome(t);
++  const previous = process.env.GROK_WECHAT_MEDIA_TIMEOUT_MS;
++  process.env.GROK_WECHAT_MEDIA_TIMEOUT_MS = "400";
++  t.after(() => {
++    if (previous === undefined) delete process.env.GROK_WECHAT_MEDIA_TIMEOUT_MS;
++    else process.env.GROK_WECHAT_MEDIA_TIMEOUT_MS = previous;
++  });
++  const server = http.createServer((req, res) => {
++    req.resume();
++    res.writeHead(200, { "content-type": "application/octet-stream", "content-length": 100 });
++    res.write("x");
++  });
++  const port = await listen(server);
++  t.after(() => server.close());
++  const started = Date.now();
++  const normalized = await normalizeInbound({
++    from_user_id: "peer",
++    message_id: "media-1",
++    item_list: [
++      { type: 1, text_item: { text: "caption" } },
++      { type: 2, image_item: { media: { full_url: `http://127.0.0.1:${port}/stall`, aes_key: "aaaa" } } },
++    ],
++  });
++  assert.equal(normalized.text, "caption");
++  assert.equal(normalized.items.find((item) => item.type === "image").path, null);
++  assert.ok(Date.now() - started < 2_000);
++});
++
++test("bounded requests keep using the configured env proxy", async () => {
++  const origin = http.createServer((req, res) => {
++    if (req.headers["x-test-proxy"] !== "1") {
++      res.writeHead(500);
++      res.end("direct");
++      return;
++    }
++    res.end("proxied");
++  });
++  const originPort = await listen(origin);
++  let proxySaw = 0;
++  const proxy = http.createServer((req, res) => {
++    proxySaw += 1;
++    const target = new URL(req.url);
++    const forwarded = http.request({
++      hostname: "127.0.0.1",
++      port: target.port || originPort,
++      path: `${target.pathname}${target.search}`,
++      method: req.method,
++      headers: { ...req.headers, "x-test-proxy": "1", host: `127.0.0.1:${target.port || originPort}` },
++    }, (up) => {
++      res.writeHead(up.statusCode || 502);
++      up.pipe(res);
++    });
++    forwarded.on("error", () => res.destroy());
++    req.pipe(forwarded);
++  });
++  const proxyPort = await listen(proxy);
++  const child = spawn(process.execPath, ["--input-type=module", "-e", `
++    import { boundedRequest } from ${JSON.stringify(path.join(path.dirname(INDEX), "bounded-request.js"))};
++    const result = await boundedRequest(${JSON.stringify(`http://127.0.0.1:${originPort}/ilink/bot/getupdates`)}, {
++      method: "POST",
++      body: "{}",
++      timeoutMs: 2000,
++    });
++    console.log(JSON.stringify({ status: result.status, body: result.buffer.toString("utf8") }));
++  `], {
++    env: {
++      ...process.env,
++      NODE_USE_ENV_PROXY: "1",
++      HTTP_PROXY: `http://127.0.0.1:${proxyPort}`,
++      http_proxy: `http://127.0.0.1:${proxyPort}`,
++      HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
++      https_proxy: `http://127.0.0.1:${proxyPort}`,
++      NO_PROXY: "",
++      no_proxy: "",
++    },
++  });
++  let out = "";
++  child.stdout.on("data", (chunk) => { out += chunk; });
++  child.stderr.on("data", (chunk) => { out += chunk; });
++  const code = await new Promise((resolve) => child.on("exit", resolve));
++  proxy.close();
++  origin.close();
++  assert.equal(code, 0, out);
++  assert.equal(proxySaw, 1);
++  assert.match(out, /proxied/);
++});
++
++test("monitor recovers from a stall and HTTP failures without losing or duplicating the cursor", { timeout: 20_000 }, async (t) => {
++  const home = useHome(t);
++  let updates = 0;
++  const tracked = trackGetUpdates((_req, res) => {
++    updates += 1;
++    if (updates === 1) return;
++    if (updates < 4) {
++      res.writeHead(500, { "content-type": "text/plain" });
++      res.end("fail");
++      return;
++    }
++    res.writeHead(200, { "content-type": "application/json" });
++    res.end(JSON.stringify({
++      ret: 0,
++      msgs: [userMessage("m-1", "hello")],
++      get_updates_buf: "cursor-2",
++      longpolling_timeout_ms: 400,
++    }));
++  });
++  const port = await listen(tracked.server);
++  t.after(() => tracked.server.close());
++  saveAccount(port);
++  const child = spawn(process.execPath, [INDEX, "--monitor"], {
++    env: {
++      ...process.env,
++      GROK_WECHAT_HOME: home,
++      GROK_WECHAT_POLL_BUDGET_MS: "400",
++      GROK_WECHAT_RETRY_MS: "20",
++      GROK_WECHAT_BACKOFF_MS: "30",
++    },
++    stdio: "ignore",
++  });
++  t.after(() => {
++    try { child.kill("SIGKILL"); } catch { /* already gone */ }
++    const pid = readPid();
++    if (pid) {
++      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
++    }
++  });
++  const inbox = paths().inbox;
++  const started = Date.now();
++  while (Date.now() - started < 8_000) {
++    if (fs.existsSync(inbox) && fs.readFileSync(inbox, "utf8").includes("m-1")) break;
++    await sleep(40);
++  }
++  const body = fs.existsSync(inbox) ? fs.readFileSync(inbox, "utf8") : "";
++  const log = fs.existsSync(paths().log) ? fs.readFileSync(paths().log, "utf8") : "";
++  assert.match(body, /"message_id":"m-1"/, log);
++  assert.equal(body.trim().split("\n").length, 1, log);
++  const afterCursor = Date.now();
++  while (Date.now() - afterCursor < 4_000) {
++    if (loadState().accounts[0].getUpdatesBuf === "cursor-2") break;
++    await sleep(40);
++  }
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-2", log);
++  await sleep(900);
++  const reread = fs.readFileSync(inbox, "utf8").trim().split("\n");
++  assert.equal(reread.length, 1, fs.readFileSync(paths().log, "utf8"));
++  assert.equal(loadState().accounts[0].seenMessageIds.includes("m-1"), true);
++  assert.match(fs.readFileSync(paths().log, "utf8"), /outcome=timeout/);
++  assert.match(fs.readFileSync(paths().log, "utf8"), /outcome=error/);
++  assert.doesNotMatch(fs.readFileSync(paths().log, "utf8"), /test-token|hello|cursor-2/);
++  const health = JSON.parse(fs.readFileSync(paths().health, "utf8"));
++  assert.equal(health.v, 1);
++  assert.equal(health.pid, child.pid);
++  assert.equal((fs.statSync(paths().health).mode & 0o777), 0o600);
++  assert.equal(assessMonitorHealth(health).stale, false);
++  assert.ok(tracked.stats().overlapMs < 200, `overlap ${tracked.stats().overlapMs}ms`);
++});
++
++test("a live monitor with an overdue poll is stale and is replaced", () => {
++  const fresh = assessMonitorHealth({
++    v: 1,
++    pid: 10,
++    started_at: Date.now() - 5_000,
++    accounts: {
++      bot1: { in_flight_since: Date.now() - 200, deadline_ms: 1_000, last_completed_at: Date.now() - 200 },
++    },
++  });
++  assert.equal(fresh.stale, false);
++  const overdue = assessMonitorHealth({
++    v: 1,
++    pid: 10,
++    started_at: Date.now() - 60_000,
++    accounts: {
++      bot1: { in_flight_since: Date.now() - 30_000, deadline_ms: 1_000, last_completed_at: Date.now() - 40_000 },
++    },
++  });
++  assert.equal(overdue.stale, true);
++  assert.equal(overdue.reason, "poll-overdue");
++  const idle = assessMonitorHealth({
++    v: 1,
++    pid: 10,
++    started_at: Date.now() - 400_000,
++    accounts: {
++      bot1: { in_flight_since: null, deadline_ms: 1_000, last_completed_at: Date.now() - 200_000 },
++    },
++  });
++  assert.equal(idle.stale, true);
++  assert.equal(idle.reason, "no-progress");
++});
++
++test("ensure-monitor restarts a stopped-alive stale poller", { timeout: 20_000 }, async (t) => {
++  const home = useHome(t);
++  const sockets = new Set();
++  const server = http.createServer((req, res) => {
++    req.resume();
++    res.writeHead(200, { "content-type": "application/json" });
++    res.end(JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "cursor-1" }));
++  });
++  server.on("connection", (socket) => {
++    sockets.add(socket);
++    socket.on("close", () => sockets.delete(socket));
++  });
++  const port = await listen(server);
++  t.after(() => {
++    for (const socket of sockets) socket.destroy();
++    server.close();
++  });
++  saveAccount(port);
++  const child = spawn(process.execPath, [INDEX, "--monitor"], {
++    env: { ...process.env, GROK_WECHAT_HOME: home, GROK_WECHAT_POLL_BUDGET_MS: "400" },
++    stdio: "ignore",
++  });
++  const pids = new Set([child.pid]);
++  t.after(async () => {
++    for (const pid of pids) {
++      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
++    }
++    const deadline = Date.now() + 1_000;
++    while (Date.now() < deadline) {
++      const alive = [...pids].some((pid) => {
++        try { process.kill(pid, 0); return true; } catch { return false; }
++      });
++      if (!alive) break;
++      await sleep(20);
++    }
++  });
++  const started = Date.now();
++  while (Date.now() - started < 5_000) {
++    if (fs.existsSync(paths().health)) {
++      const health = JSON.parse(fs.readFileSync(paths().health, "utf8"));
++      if (health.pid === child.pid && health.accounts?.bot1?.last_completed_at) break;
++    }
++    await sleep(30);
++  }
++  writePid(child.pid);
++  process.kill(child.pid, "SIGSTOP");
++  const stale = {
++    v: 1,
++    pid: child.pid,
++    started_at: Date.now() - 400_000,
++    updated_at: Date.now(),
++    accounts: {
++      bot1: {
++        in_flight_since: Date.now() - 30_000,
++        deadline_ms: 1_000,
++        last_completed_at: Date.now() - 200_000,
++        last_outcome: "timeout",
++        consecutive_timeouts: 4,
++        consecutive_errors: 0,
++      },
++    },
++  };
++  fs.writeFileSync(paths().health, JSON.stringify(stale), { mode: 0o600 });
++  const checker = spawn(process.execPath, [INDEX, "--ensure-monitor"], {
++    env: { ...process.env, GROK_WECHAT_HOME: home },
++  });
++  let out = "";
++  checker.stdout.on("data", (chunk) => { out += chunk; });
++  const code = await new Promise((resolve) => checker.on("exit", resolve));
++  assert.equal(code, 0, out);
++  const summary = JSON.parse(out);
++  assert.equal(summary.restarted, true);
++  assert.equal(summary.previous_pid, child.pid);
++  assert.notEqual(summary.pid, child.pid);
++  pids.add(summary.pid);
++  await sleep(100);
++  assert.equal(readPid(), summary.pid);
++  let alive = true;
++  try { process.kill(child.pid, 0); } catch { alive = false; }
++  assert.equal(alive, false);
++});
++
++test("gzip long-poll bodies decode before the cursor is considered", async (t) => {
++  useHome(t);
++  const payload = Buffer.from(JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "cursor-9", longpolling_timeout_ms: 400 }));
++  const gzip = zlib.gzipSync(payload);
++  const server = http.createServer((req, res) => {
++    req.resume();
++    res.writeHead(200, {
++      "content-type": "application/json",
++      "content-encoding": "gzip",
++      "content-length": String(gzip.length),
++    });
++    res.end(gzip);
++  });
++  const port = await listen(server);
++  t.after(() => server.close());
++  saveAccount(port);
++  const result = await getUpdates(loadState().accounts[0]);
++  assert.equal(result.outcome, "empty");
++  assert.equal(result.get_updates_buf, "cursor-9");
++  assert.equal(loadState().accounts[0].getUpdatesBuf, "cursor-1");
++});
++
++test("direct boundedRequest deadline is independent of the 300s dispatcher default", async (t) => {
++  const server = http.createServer((req, res) => {
++    req.resume();
++    res.writeHead(200, { "content-type": "application/json", "content-length": 20 });
++  });
++  const port = await listen(server);
++  t.after(() => server.close());
++  const started = Date.now();
++  await assert.rejects(
++    boundedRequest(`http://127.0.0.1:${port}/stall`, { method: "POST", body: "{}", timeoutMs: 300 }),
++    (err) => err.code === "TIMEOUT",
++  );
++  const duration = Date.now() - started;
++  assert.ok(duration < 1_000, `body stall lasted ${duration}ms`);
++});

@@ -23,6 +23,7 @@ export function paths() {
     pid: path.join(home, "monitor.pid"),
     media: path.join(home, "media"),
     log: path.join(home, "monitor.log"),
+    health: path.join(home, "monitor-health.json"),
   };
 }
 
@@ -358,6 +359,46 @@ export function readPid() {
 export function clearPid() {
   const { pid } = paths();
   if (fs.existsSync(pid)) fs.unlinkSync(pid);
+}
+
+export function clearOwnPid() {
+  if (readPid() === process.pid) clearPid();
+}
+
+export function writeMonitorHealth(snapshot) {
+  ensureHome();
+  writePrivateJson(paths().health, snapshot);
+}
+
+export function readMonitorHealth() {
+  if (!checkStateHome(homeDir())) return null;
+  const raw = readCredential(paths().health);
+  if (!raw || raw.v !== 1) return null;
+  return raw;
+}
+
+export function assessMonitorHealth(health, now = Date.now()) {
+  if (!health || health.v !== 1) return { stale: false, reason: "unknown" };
+  const rows = Object.values(health.accounts || {});
+  const startedAge = now - (Number(health.started_at) || now);
+  if (!rows.length) {
+    if (startedAge > 180_000) return { stale: true, reason: "no-progress" };
+    return { stale: false, reason: "starting" };
+  }
+  for (const row of rows) {
+    const deadline = Number(row.deadline_ms) > 0 ? Number(row.deadline_ms) : 45_000;
+    if (row.in_flight_since && now - Number(row.in_flight_since) > deadline + 15_000) {
+      return { stale: true, reason: "poll-overdue" };
+    }
+    const completed = Number(row.last_completed_at) || 0;
+    if (!row.in_flight_since && completed && now - completed > 180_000) {
+      return { stale: true, reason: "no-progress" };
+    }
+    if (!completed && startedAge > 180_000) {
+      return { stale: true, reason: "never-completed" };
+    }
+  }
+  return { stale: false, reason: "ok" };
 }
 
 export function isPidAlive(pid) {
