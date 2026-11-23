@@ -4,25 +4,32 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   appendInbox,
-  clearPid,
+  assessMonitorHealth,
+  clearOwnPid,
   drainInbox,
   findAccount,
   isAllowed,
+  isPidAlive,
   listAccounts,
   loadState,
   monitorRunning,
   paths,
+  readMonitorHealth,
   removeAccount,
   resolveWakeForAccount,
   stopMonitorProcess,
   updateState,
+  writeMonitorHealth,
   writePid,
 } from "./store.js";
 import {
   collectInbound,
+  commitInboundCursor,
   getUpdates,
   loginStart,
   loginWait,
+  longPollDeadlineMs,
+  messageKey,
   notifyStart,
   notifyStop,
   sendMedia,
@@ -62,10 +69,18 @@ async function sleep(ms) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-function ensureMonitor() {
+function waitDead(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const gate = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    Atomics.wait(gate, 0, 0, 50);
+  }
+  return !isPidAlive(pid);
+}
+
+function spawnMonitor() {
   const accounts = listAccounts();
-  const existing = monitorRunning();
-  if (existing) return { already_running: true, pid: existing };
   if (!accounts.length) return { started: false, reason: "not_logged_in" };
   const child = spawn(process.execPath, [self, "--monitor"], {
     detached: true,
@@ -75,6 +90,51 @@ function ensureMonitor() {
   child.unref();
   writePid(child.pid);
   return { started: true, pid: child.pid, account_count: accounts.length };
+}
+
+function ensureMonitor() {
+  const existing = monitorRunning();
+  if (existing) {
+    const health = readMonitorHealth();
+    const verdict = health?.pid === existing
+      ? assessMonitorHealth(health)
+      : { stale: false, reason: "no-matching-health" };
+    if (!verdict.stale) return { already_running: true, pid: existing, stale: false };
+    try { process.kill(existing, "SIGTERM"); } catch { /* already gone */ }
+    if (!waitDead(existing, 3_000)) {
+      try { process.kill(existing, "SIGKILL"); } catch { /* already gone */ }
+      waitDead(existing, 1_000);
+    }
+    const started = spawnMonitor();
+    return { ...started, restarted: true, previous_pid: existing, stale_reason: verdict.reason };
+  }
+  return spawnMonitor();
+}
+
+function monitorHealthSummary() {
+  const health = readMonitorHealth();
+  if (!health) return null;
+  const verdict = assessMonitorHealth(health);
+  const accounts = Object.entries(health.accounts || {}).map(([bot, row]) => ({
+    ilink_bot_id: bot,
+    last_outcome: row.last_outcome || "",
+    last_completed_at: row.last_completed_at || null,
+    last_exchange_at: row.last_exchange_at || null,
+    last_message_at: row.last_message_at || null,
+    consecutive_timeouts: row.consecutive_timeouts || 0,
+    consecutive_errors: row.consecutive_errors || 0,
+    in_flight_ms: row.in_flight_since ? Math.max(0, Date.now() - row.in_flight_since) : 0,
+    deadline_ms: row.deadline_ms || 0,
+  }));
+  return {
+    stale: verdict.stale,
+    stale_reason: verdict.reason,
+    degraded: accounts.some((row) => row.consecutive_timeouts >= 3 || row.consecutive_errors > 0),
+    pid: health.pid || 0,
+    started_at: health.started_at || null,
+    updated_at: health.updated_at || null,
+    accounts,
+  };
 }
 
 function startMonitorOnConnect() {
@@ -117,6 +177,7 @@ const tools = {
     handle: async () => {
       const payload = statusPayload();
       payload.monitor_pid = monitorRunning();
+      payload.monitor_health = monitorHealthSummary();
       return ok(payload);
     },
   },
@@ -419,16 +480,117 @@ async function wakeAgent(messages, log) {
   }
 }
 
-async function pollAccount(account, log) {
-  const raw = await getUpdates(account);
-  if (raw.session_expired) {
-    log(`session expired bot=${account.ilinkBotId}`);
-    return { messages: [], expired: true };
+function botLabel(account) {
+  return String(account.ilinkBotId || "unknown").replace(/[\s\r\n]/g, "").slice(0, 80);
+}
+
+function configuredDelay(name, fallback) {
+  const n = Number(process.env[name]);
+  if (Number.isFinite(n) && n >= 0 && n < 120_000) return n;
+  return fallback;
+}
+
+function saveHealth(health) {
+  health.updated_at = Date.now();
+  try {
+    writeMonitorHealth(health);
+  } catch {
+    // Health is diagnostic. A write failure must not stop polling.
   }
-  const collected = await collectInbound(raw.msgs || [], account);
-  const state = loadState();
-  const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
-  return { messages: allowed, expired: false };
+}
+
+function restartAfterOverdue(log) {
+  log("poll outcome=overdue action=restart");
+  try {
+    const child = spawn(process.execPath, [self, "--monitor"], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+    writePid(child.pid);
+    log(`monitor respawn pid=${child.pid}`);
+  } catch (err) {
+    log(`monitor respawn failed code=${err?.code || ""}`);
+  }
+  process.exit(1);
+}
+
+async function pollAccount(account, log, health) {
+  const bot = botLabel(account);
+  const row = health.accounts[bot] || {
+    last_completed_at: null,
+    last_exchange_at: null,
+    last_message_at: null,
+    last_outcome: "",
+    last_duration_ms: 0,
+    deadline_ms: 0,
+    consecutive_timeouts: 0,
+    consecutive_errors: 0,
+    in_flight_since: null,
+  };
+  health.accounts[bot] = row;
+  const started = Date.now();
+  const deadline = longPollDeadlineMs(account);
+  row.deadline_ms = deadline;
+  row.in_flight_since = started;
+  saveHealth(health);
+  let restarting = false;
+  const watchdog = setTimeout(() => {
+    restarting = true;
+    row.in_flight_since = started;
+    saveHealth(health);
+    restartAfterOverdue(log);
+  }, deadline + configuredDelay("GROK_WECHAT_WATCHDOG_SLACK_MS", 20_000));
+  try {
+    const raw = await getUpdates(account);
+    const outcome = raw.outcome || (raw.session_expired ? "expired" : "empty");
+    row.last_completed_at = Date.now();
+    row.last_outcome = outcome;
+    row.last_duration_ms = Number(raw.duration_ms) || (Date.now() - started);
+    row.deadline_ms = Number(raw.deadline_ms) || deadline;
+    row.in_flight_since = null;
+    if (outcome === "timeout") row.consecutive_timeouts += 1;
+    else if (outcome === "expired" || outcome === "empty" || outcome === "messages") {
+      row.consecutive_timeouts = 0;
+      row.consecutive_errors = 0;
+      if (outcome !== "expired") row.last_exchange_at = Date.now();
+    }
+    log(`poll outcome=${outcome} bot=${bot} duration_ms=${row.last_duration_ms} deadline_ms=${row.deadline_ms} msgs=${Array.isArray(raw.msgs) ? raw.msgs.length : 0} consecutive_timeouts=${row.consecutive_timeouts}`);
+    if (outcome === "timeout" || outcome === "busy") {
+      return { account, messages: [], expired: false, outcome, commit: false };
+    }
+    if (outcome === "expired" || raw.session_expired) {
+      return { account, messages: [], expired: true, outcome: "expired", commit: false };
+    }
+    const seen = new Set((account.seenMessageIds || []).map(String));
+    const collected = await collectInbound(raw.msgs || [], account, seen);
+    const state = loadState();
+    const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
+    if (allowed.length) row.last_message_at = Date.now();
+    row.last_outcome = allowed.length ? "messages" : "empty";
+    return {
+      account,
+      messages: allowed,
+      expired: false,
+      outcome: row.last_outcome,
+      commit: raw.commit === true,
+      get_updates_buf: raw.get_updates_buf,
+      seenIds: (raw.msgs || []).map(messageKey).filter(Boolean),
+      longPollTimeoutMs: raw.longPollTimeoutMs,
+    };
+  } catch (err) {
+    row.last_completed_at = Date.now();
+    row.in_flight_since = null;
+    row.last_outcome = "error";
+    row.consecutive_errors += 1;
+    row.last_duration_ms = Date.now() - started;
+    log(`poll outcome=error bot=${bot} name=${err?.name || "Error"} code=${err?.code || ""} ret=${err?.ret ?? ""} errcode=${err?.errcode ?? ""} consecutive_errors=${row.consecutive_errors}`);
+    throw err;
+  } finally {
+    clearTimeout(watchdog);
+    if (!restarting) saveHealth(health);
+  }
 }
 
 async function runMonitor() {
@@ -436,13 +598,21 @@ async function runMonitor() {
   const log = (line) => {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
-  log("monitor start");
+  log(`monitor start pid=${process.pid}`);
+  const health = {
+    v: 1,
+    pid: process.pid,
+    started_at: Date.now(),
+    updated_at: Date.now(),
+    accounts: {},
+  };
+  saveHealth(health);
   const accounts = listAccounts();
   await Promise.all(accounts.map((a) => notifyStart(a)));
   const onExit = async () => {
     const current = listAccounts(loadState({ createHome: false }));
     await Promise.all(current.map((a) => notifyStop(a)));
-    clearPid();
+    clearOwnPid();
     process.exit(0);
   };
   process.on("SIGTERM", onExit);
@@ -453,24 +623,49 @@ async function runMonitor() {
       const accountsNow = listAccounts();
       if (!accountsNow.length) {
         log("no accounts, stopping");
-        clearPid();
+        clearOwnPid();
         process.exit(0);
       }
-      const results = await Promise.all(accountsNow.map((account) => pollAccount(account, log)));
-      failures = 0;
-      const batch = results.flatMap((r) => r.messages);
-      if (results.some((r) => r.expired)) {
-        await sleep(60_000);
+      const settled = await Promise.allSettled(accountsNow.map((account) => pollAccount(account, log, health)));
+      const results = [];
+      let errors = 0;
+      for (const item of settled) {
+        if (item.status === "fulfilled") results.push(item.value);
+        else errors += 1;
+      }
+      for (const result of results) {
+        if (result.messages.length) appendInbox(result.messages);
+        if (result.commit) {
+          commitInboundCursor(result.account, {
+            getUpdatesBuf: result.get_updates_buf,
+            seenIds: result.seenIds,
+            longPollTimeoutMs: result.longPollTimeoutMs,
+          });
+        }
+      }
+      const batch = results.flatMap((result) => result.messages);
+      if (errors === 0 && results.every((result) => result.outcome === "empty" || result.outcome === "messages")) {
+        failures = 0;
+      }
+      if (errors) {
+        failures += 1;
+        await sleep(failures >= 3
+          ? configuredDelay("GROK_WECHAT_BACKOFF_MS", 30_000)
+          : configuredDelay("GROK_WECHAT_RETRY_MS", 2_000));
+      }
+      if (results.some((result) => result.expired)) {
+        await sleep(configuredDelay("GROK_WECHAT_EXPIRED_MS", 60_000));
       }
       if (batch.length) {
-        appendInbox(batch);
         log(`inbox +${batch.length}`);
         await wakeAgent(batch, log);
       }
     } catch (err) {
       failures += 1;
-      log(`getupdates error ${err instanceof Error ? err.message : String(err)}`);
-      await sleep(failures >= 3 ? 30_000 : 2_000);
+      log(`poll outcome=error name=${err?.name || "Error"} code=${err?.code || ""}`);
+      await sleep(failures >= 3
+        ? configuredDelay("GROK_WECHAT_BACKOFF_MS", 30_000)
+        : configuredDelay("GROK_WECHAT_RETRY_MS", 2_000));
     }
   }
 }
